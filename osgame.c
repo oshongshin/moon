@@ -1,122 +1,216 @@
+// windeow + MinGW 환경에서는 `fork(), sys/wait.h 사용불가`
+#include <errno.h>
 #include <stdio.h>
-#include <time.h>
+#include <stdlib.h>
 #include <unistd.h>
-#define ROW 8 /*행(가로)*/
-#define COL 7 /*열(세로)*/
-int board[ROW][COL];
+#include <sys/wait.h>
+#include <signal.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
 
-int initialize_board(int board[ROW][COL]) {/*모든 칸을 0으로 초기화*/
-    for (int R = 0;R < ROW;R++) {
-        for (int C = 0;C < COL;C++) {
-            board[R][C] = 0;
+#define READ 0
+#define WRITE 1
+
+char board[6][7];
+char player_symbols[2] = { '1', '2' };
+pid_t current_child_pid;
+
+int moves = 0;
+
+void handle_sigchld(int sig) {
+    int saved_errno = errno; // 리엔트런시 보호용
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved_errno;
+}
+
+void visualize_board(int current_player, int moves)
+{
+    printf("\nCurrent Board:\n");
+    printf("A B C D E F G\n");
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 7; j++) {
+            char symbol = board[i][j];
+            printf("%c ", symbol);
+        }
+        printf("\n");
+    }
+    char player_char = (player_symbols[current_player] == '1') ? 'X' : 'Y';
+    printf("\nTurn %d-Agent%c move the stone#%d\n", moves + 1, player_char, (moves / 2) + 1);
+}
+
+int validate_choice(char choice)
+{
+    return (choice >= 'A' && choice <= 'G');
+}
+
+int update_board(char choice, int player)
+{
+    int col = choice - 'A';
+    for (int i = 5; i >= 0; i--) {
+        if (board[i][col] == '0') {
+            board[i][col] = player_symbols[player];
+            return 1;
         }
     }
     return 0;
 }
-int print_board(int board[ROW][COL]) {/*각 칸을 0,1,2 로 표시해서 출력, */
-    printf("A B C D E F G\n");
-    for (int R = 0;R < ROW;R++) {
-        for (int C = 0;C < COL;C++) {
-            printf("%d ", board[R][C]);
-            /*맨 위에 열 이름 출력(A-G)*/
-        }
-        printf("\n");
-    }
-}
-int drop_piece(int board[ROW][COL], int col,int player) {
-    /* 만약 column이 범위를 벗어나거나 꽉 차 있다면 실패 (0 반환)
-    아래부터 위로 올라가며 빈 칸 찾기
-    찾으면 player 번호로 채우고 성공 (1 반환)
-    */
-    if (board[row][col] != 0) {/*꽉 찬 스택, 빈 칸 없으면 실패*/
-        return 0;
-    }
-    while (1) {
-        if (board[row][col] == 0 && board[row][col - 1] != 0) {/*빈 스택 중 가장 위에 있는 칸 발견*/
-            board[row][col] = player;
-            return 1;
-        }
-        col--;
-        if (col <= 0) {
-            printf("오류");
-            return 0;
-            break;     
+
+int check_winner(int player)
+{
+    char symbol = player_symbols[player];
+
+    // 가로, 세로, 대각선으로 4개가 연속되었는지 검사
+    for (int row = 0; row < 6; row++) {
+        for (int col = 0; col < 7; col++) {
+            if (board[row][col] != symbol)
+                continue;
+
+            // 가로 체크
+            if (col <= 3 && board[row][col + 1] == symbol && board[row][col + 2] == symbol && board[row][col + 3] == symbol)
+                return 1;
+            // 세로 체크
+            if (row <= 2 && board[row + 1][col] == symbol && board[row + 2][col] == symbol && board[row + 3][col] == symbol)
+                return 1;
+            // 대각선 체크(오른쪽 아래)
+            if (row <= 2 && col <= 3 && board[row + 1][col + 1] == symbol && board[row + 2][col + 2] == symbol && board[row + 3][col + 3] == symbol)
+                return 1;
+            // 대각선 체크(왼쪽 아래)
+            if (row <= 2 && col >= 3 && board[row + 1][col - 1] == symbol && board[row + 2][col - 2] == symbol && board[row + 3][col - 3] == symbol)
+                return 1;
         }
     }
+    return 0;
 }
-double three_second() {/*3초 측정 함수*/
-    clock_t start, end;
-    start = clock();
-    //성능 측정- 아직 구현 덜 됨. main에서 start, end 받아야할듯?
-    end = clock();
-    double duration = (double)(end - start) / CLOCKS_PER_SEC;
-    return duration;
 
+
+void timeout_handler(int sig) {
+    printf("\nAgent timed out! Opponent wins!\n");
+    kill(current_child_pid, SIGKILL); // 자식 프로세스 강제 종료
+    exit(EXIT_FAILURE); // 현재 프로세스도 종료시켜 게임 종료
 }
-int get_agent_move(agent_path, player, board) {
-    /*
-    pipe()로 자식 프로세스와 통신할 파이프 생성
-    fork()로 자식 프로세스 생성
-    자식은 표준 입출력을 pipe로 리다이렉트 후 execl(agent 실행)
-    부모는 보드 상태를 자식에게 보내고, 응답을 3초 동안 기다림
-        응답 없거나 잘못된 값이면 'X' 반환
-    응답 문자(move)를 받아 대문자로 변환해서 반환
-    */
+
+void handle_sigint(int sig)
+{
+    printf("\nInterrupted! Cleaning up...\n");
+    kill(current_child_pid, SIGKILL);
+    exit(EXIT_FAILURE);
 }
-int check_winner(board) {
-    /* 각 칸을 검사해서
-    가로, 세로, 대각선(↘, ↙)으로 4개 연속이면 승리 (해당 player 번호 반환)
-    없으면 0 반환
-    */
-    int winner;
-    while (1){
-    for (int R = ROW-1;R >=0;R--) {
-        for (int C = 0;C < COL;C++) {
-            if (board[R][C] == board[R][C - 1] &&
-                board[R][C - 1] == board[R][C - 2] &&
-                board[R][C - 2] == board[R][C - 3]) {/*가로*/
-                winner = board[R][C];
-                return winner;
-            }
-            else if (board[R][C] == board[R - 1][C] &&
-                board[R-1][C] == board[R - 2][C] &&
-                board[R-2][C] == board[R - 3][C]) {/*세로*/
-                winner = board[R][C];
-                return winner;
-            }
-            else if (board[R][C] == board[R - 1][C - 1] &&
-                board[R-1][C-1] == board[R - 2][C - 2] &&
-                board[R-2][C-2] == board[R - 3][C - 3]) {
-                winner = board[R][C];
-                return winner;
-            }
-            else {
-                return 0;
-            }
-        }
+
+int main(int argc, char* argv[])
+{
+    if (argc != 5 || strcmp(argv[1], "-X") != 0 || strcmp(argv[3], "-Y") != 0) {
+        printf("Usage: ./gamatch -X <agent-binary> -Y <agent-binary>\n");
+        exit(EXIT_FAILURE);
     }
+
+    signal(SIGINT, handle_sigint); // Ctrl+C 핸들러
+    signal(SIGALRM, timeout_handler);
+    signal(SIGCHLD, handle_sigchld);
+
+    memset(board, '0', sizeof(board));
+    int current_player = 0;
+    int winner = -1;
+
+    while (winner == -1 && moves < 42) {
+        visualize_board(current_player, moves);
+        sleep(1);
+
+        int ptoc[2], ctop[2];
+        pipe(ptoc);
+        pipe(ctop);
+
+        current_child_pid = fork();
+
+        if (current_child_pid == 0) {
+            dup2(ptoc[READ], STDIN_FILENO);
+            dup2(ctop[WRITE], STDOUT_FILENO);
+            close(ptoc[WRITE]);
+            close(ctop[READ]);
+
+            execl(argv[current_player * 2 + 2], argv[current_player * 2 + 2], NULL);
+            perror("exec");
+            exit(EXIT_FAILURE);
+        }
+
+        close(ptoc[READ]);
+        close(ctop[WRITE]);
+
+        FILE* agent_input = fdopen(ptoc[WRITE], "w");
+        fprintf(agent_input, "%d\n", current_player + 1);
+        for (int i = 0; i < 6; i++) {
+            for (int j = 0; j < 7; j++) {
+                fprintf(agent_input, "%c ", board[i][j]);
+            }
+            fprintf(agent_input, "\n");
+        }
+        fclose(agent_input);
+
+
+        struct itimerval timer;
+        timer.it_value.tv_sec = 3;
+        timer.it_value.tv_usec = 0;
+        timer.it_interval.tv_sec = 0;
+        timer.it_interval.tv_usec = 0;
+        setitimer(ITIMER_REAL, &timer, NULL);
+
+        int status;
+        waitpid(current_child_pid, &status, 0);
+
+        timer.it_value.tv_sec = 0;
+        setitimer(ITIMER_REAL, &timer, NULL);
+
+        char agent_choice = '\0';
+        read(ctop[READ], &agent_choice, 1);
+        close(ctop[READ]);
+
+        if (!validate_choice(agent_choice) || !update_board(agent_choice, current_player)) {
+            printf("Invalid move! Opponent wins!\n");
+            winner = 1 - current_player;
+            break;
+        }
+
+        if (check_winner(current_player)) {
+            winner = current_player;
+            break;
+        }
+
+        current_player = 1 - current_player;
+        moves++;
+    }
+
+    visualize_board(current_player, moves);
+    if (winner != -1) {
+        char winner_symbol = player_symbols[winner];
+        char winner_name = (winner_symbol == '1') ? 'X' : 'Y';
+        int point = (moves + 1) / 2;
+        printf("Player %c wins!\n", winner_name);
+        printf("%d point\n", point);
+    }
+    else {
+        printf("The game ended in a draw!\n");
+    }
+
+    return EXIT_SUCCESS;
 }
-int main() {
-    /*
-    명령행 인자 확인 (-X agent1 -Y agent2 형식)
-    보드 초기화
-    초기 보드 출력
 
-    while true:
-        현재 턴의 agent로부터 move 받아오기
-        move 문자를 열 번호로 변환
-
-        실패 조건 확인:
-            - 3초 내 응답 없으면 -> 잘못된 move 처리 ('X')
-            - move가 유효하지 않은 문자거나 범위 벗어나면 패배
-            - drop_piece 실패 (열이 꽉 참)하면 패배
-
-        보드에 말 놓기
-        보드 출력
-
-        승자 확인:
-            - 승자 있으면 종료
-
-        다음 턴으로 전환
-    */
-}
+/*
+Main()
+│
+├── 초기화
+│     ├── 명령어 인수 파싱
+│     ├── Signal 핸들러 등록(signal, setitimer)
+│     └── 게임 보드 초기화
+│
+└── 게임 루프 (while)
+      ├── 보드 시각화 (visualize_board)
+      ├── 파이프 생성(pipe)
+      ├── 프로세스 생성(fork)
+      │    ├─ 자식 프로세스(exec)
+      │    └─ 부모 프로세스
+      │        ├─ 에이전트 입력 전달
+      │        ├─ SIGALRM 기반 타임아웃 제어 (setitimer)
+      │        ├─ 자식 프로세스 대기(waitpid)
+      │        └─ IPC를 통한 선택 수신 및 검증
+      └── 게임 종료 조건 체크(check_winner)
+*/
